@@ -1,0 +1,13 @@
+=== Model Accuracy Results ===
+logistic: 0.4815
+random_forest: 0.4444
+knn: 0.4444
+gradient_boosting: 0.3333
+svm: 0.4074
+ensemble: 0.3333
+kmeans: 0.4074
+
+Best model: logistic
+Timestamp: 20250510_012454
+Feature count: 131
+Literary movements: Gothicism, Modernism, Naturalism, Realism, Renaissance, Romanticism, Transcendentalism

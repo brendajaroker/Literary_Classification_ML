@@ -8,124 +8,252 @@ from nltk.corpus import wordnet, stopwords
 from nltk.tokenize import sent_tokenize
 from nltk.stem import WordNetLemmatizer
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
-from sklearn.feature_selection import SelectKBest, chi2, mutual_info_classif
+from sklearn.feature_selection import SelectKBest, chi2, mutual_info_classif, f_classif
 from gensim import corpora
-from gensim.models import LdaModel
+from gensim.models import LdaModel, Word2Vec, FastText
+from sklearn.decomposition import NMF
+from gensim.models.phrases import Phrases, Phraser
 import numpy as np
 from collections import Counter
 import time
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import pickle
 
 # Download NLTK data
 nltk.download('wordnet')
 nltk.download('stopwords')
 nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger')
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger()
 
-# Load SpaCy model
-nlp = spacy.load("en_core_web_sm", disable=["ner"])  # Keep lemmatizer but disable NER for speed
+# Load SpaCy model - use medium model for better language understanding
+try:
+    nlp = spacy.load("en_core_web_md", disable=["ner"])
+except OSError:
+    print("Downloading en_core_web_md...")
+    os.system("python -m spacy download en_core_web_md")
+    nlp = spacy.load("en_core_web_md", disable=["ner"])
 
-# Load stop words
+# Load stop words with custom literary additions
 stop_words = set(stopwords.words('english'))
+# Remove some stopwords that could be stylistically important
+for word in ['no', 'not', 'very', 'few', 'more', 'most', 'against', 'own']:
+    if word in stop_words:
+        stop_words.remove(word)
+
 lemmatizer = WordNetLemmatizer()
 
-# Enhanced movement-specific features
-# These are expanded with more period-appropriate and stylistically relevant terms
+# Enhanced movement-specific features with more comprehensive term lists
+# Enhanced movement-specific features with more comprehensive term lists
 movement_specific_features = {
     "Romanticism": [
+        # Original terms
         "forlorn", "miserly", "passion", "heart", "sublime", "nature", "soul", "emotion", 
         "beauty", "imagination", "dream", "vision", "melancholy", "solitude", "wild", 
         "supernatural", "gothic", "quest", "pastoral", "medieval", "individualism",
-        "spontaneous", "liberty", "innocence", "nostalgic", "mysterious", "wanderer"
+        "spontaneous", "liberty", "innocence", "nostalgic", "mysterious", "wanderer",
+        # Additional terms
+        "spiritual", "transcendent", "awe", "rapture", "reverie", "moonlight", "divine",
+        "eternal", "infinite", "sublime", "idyllic", "myth", "legend", "fantasy", "fairy",
+        "sentiment", "feeling", "passion", "yearning", "longing", "exotic", "faraway",
+        "primal", "authentic", "genuine", "untamed", "primitive", "folk", "ballad",
+        "freedom", "revolution", "visionary", "dreamer", "madness", "despair", "ecstasy",
+        "genius", "prodigy", "creativity", "inspiration", "muse"
     ],
+    
     "Realism": [
+        # Original terms
         "palpable", "manifest", "society", "class", "work", "money", "family", "everyday", 
         "objective", "accurate", "ordinary", "common", "realistic", "detailed", "precise",
         "practical", "factual", "empirical", "mundane", "middle-class", "city", "urban",
-        "industrial", "scientific", "documentary", "literal", "observable", "concrete"
+        "industrial", "scientific", "documentary", "literal", "observable", "concrete",
+        # Additional terms
+        "actual", "real", "authentic", "genuine", "natural", "truthful", "unembellished",
+        "unvarnished", "straightforward", "direct", "plain", "unadorned", "unpretentious",
+        "unromantic", "unsentimental", "prosaic", "matter-of-fact", "workday", "humdrum",
+        "commonplace", "conventional", "normal", "regular", "standard", "average", "typical",
+        "customary", "habitual", "routine", "hourly", "daily", "weekly", "monthly", "yearly",
+        "labor", "trade", "profession", "job", "employment", "industry", "commerce", "business",
+        "transaction", "exchange", "banking", "economics", "market", "domestic", "household"
     ],
+    
     "Naturalism": [
+        # Original terms
         "fate", "instinct", "survival", "poverty", "force", "determinism", "environment", 
         "heredity", "struggle", "brutal", "harsh", "primitive", "animal", "darwinian", 
         "savage", "scientific", "experiment", "observation", "lower-class", "squalor", 
-        "disease", "violence", "pessimism", "inevitable", "biological", "evolutionary"
+        "disease", "violence", "pessimism", "inevitable", "biological", "evolutionary",
+        # Additional terms
+        "amoral", "indifferent", "mechanical", "physiological", "genetic", "psychological",
+        "depravity", "degeneration", "corruption", "vice", "alcoholism", "addiction", "slum",
+        "tenement", "filth", "dirt", "grime", "sewage", "stench", "sweat", "labor", "toil",
+        "drudgery", "beast", "brute", "ape", "primate", "organism", "species", "specimen",
+        "predator", "prey", "victim", "natural selection", "adaptation", "degeneration",
+        "entropy", "devolution", "regression", "atavism", "clinical", "pathological",
+        "antisocial", "criminal", "delinquent", "vagrant", "proletariat", "underclass"
     ],
+    
     "Gothicism": [
+        # Original terms
         "shadow", "grave", "fear", "dark", "ghost", "horror", "supernatural", "mysterious", 
         "castle", "ruin", "ancient", "terror", "death", "decay", "eerie", "monstrous", 
         "macabre", "grotesque", "nocturnal", "haunted", "spectral", "melancholy", "doom",
-        "gloomy", "curse", "omen", "diabolic", "dread", "foreboding", "sinister"
+        "gloomy", "curse", "omen", "diabolic", "dread", "foreboding", "sinister",
+        # Additional terms
+        "abbey", "cathedral", "monastery", "crypt", "dungeon", "chamber", "tower", "turret",
+        "labyrinth", "passageway", "corridor", "staircase", "cellar", "attic", "mansion",
+        "ancestral", "inheritance", "bloodline", "descendant", "nobility", "aristocracy",
+        "villain", "tyrant", "madman", "lunatic", "maniac", "fiend", "demon", "devil",
+        "specter", "apparition", "phantom", "wraith", "revenant", "banshee", "ghoul",
+        "vampire", "werewolf", "monster", "creature", "beast", "abomination", "undead",
+        "coffin", "tomb", "catacombs", "graveyard", "cemetery", "mausoleum", "sepulcher",
+        "wail", "scream", "shriek", "howl", "moan", "groan", "whisper", "hiss"
     ],
+    
     "Transcendentalism": [
+        # Original terms
         "spirit", "divine", "truth", "individual", "universe", "self-reliance", "intuition", 
         "consciousness", "oversoul", "nature", "harmony", "moral", "simplicity", "spiritual", 
-        "inherent", "goodness", "wilderness", "transcend", "enlightenment", "intellect", 
-        "meditation", "ideal", "reform", "higher", "eternal", "transparent", "reverence"
+        "inherent", "goodness", "wilderness", "inherent", "transcend", "enlightenment", "intellect", 
+        "meditation", "ideal", "reform", "higher", "eternal", "transparent", "reverence",
+        # Additional terms
+        "emerson", "thoreau", "walden", "concord", "brook farm", "dial", "pantheism",
+        "universal", "cosmic", "unity", "oneness", "whole", "integrity", "authentic", "genuine",
+        "transparent", "sincerity", "candor", "contemplation", "reflection", "solitude",
+        "hermit", "pond", "lake", "forest", "woods", "clearing", "path", "journey", "quest",
+        "seeking", "introspection", "self-examination", "self-knowledge", "insight", "wisdom",
+        "perception", "comprehension", "understanding", "realization", "awakening", "epiphany",
+        "revelation", "enlightenment", "illumination", "clarity", "veil", "beyond", "above"
     ],
+    
     "Modernism": [
+        # Original terms
         "fragment", "chaos", "memory", "time", "consciousness", "stream", "alienation", 
         "interior", "subjective", "psychological", "disillusion", "existential", "cynical",
         "abstract", "innovation", "experiment", "epiphany", "urban", "flux", "relativity",
-        "discontinuity", "skepticism", "absurd", "irony", "juxtaposition", "montage"
+        "discontinuity", "skepticism", "absurd", "irony", "juxtaposition", "montage",
+        # Additional terms
+        "joyce", "woolf", "eliot", "pound", "faulkner", "hemingway", "kafka", "proust",
+        "metropolis", "city", "apartment", "skyscraper", "automobile", "machine", "industry",
+        "technology", "progress", "science", "freud", "psychoanalysis", "unconscious", "dream",
+        "symbol", "metaphor", "allusion", "intertextuality", "pastiche", "collage", "palimpsest",
+        "world war", "trench", "soldier", "veteran", "shellshock", "trauma", "wound", "scar",
+        "disillusionment", "despair", "emptiness", "void", "nothingness", "meaninglessness",
+        "isolation", "loneliness", "estrangement", "outsider", "exile", "rootless", "displaced",
+        "cosmopolitan", "international", "expatriate", "bohemian", "avant-garde", "manifesto",
+        "movement", "rupture", "break", "tradition", "convention", "orthodoxy", "establishment"
     ],
+    
     "Renaissance": [
+        # Original terms
         "classical", "humanism", "virtue", "rhetoric", "reason", "renaissance", "pagan",
         "greco-roman", "courtly", "sonnet", "wit", "allegory", "platonic", "pastoral",
         "renaissance", "civilization", "worldly", "skeptical", "renaissance", "knowledge",
-        "patronage", "learning", "discovery", "rebirth", "harmony", "proportion", "counsel"
+        "patronage", "learning", "discovery", "rebirth", "harmony", "proportion", "counsel",
+        # Additional terms
+        "italy", "florence", "venice", "medici", "pope", "machiavelli", "petrarch", "boccaccio",
+        "aristotle", "plato", "cicero", "virgil", "horace", "ovid", "seneca", "plutarch",
+        "monarchy", "court", "prince", "duke", "nobility", "aristocracy", "merchant", "guild",
+        "education", "liberal arts", "trivium", "quadrivium", "grammar", "logic", "rhetoric",
+        "arithmetic", "geometry", "astronomy", "music", "university", "academy", "scholar",
+        "manuscript", "codex", "printing", "press", "vernacular", "latin", "greek", "translation",
+        "oration", "discourse", "dialogue", "debate", "eloquence", "persuasion", "statecraft",
+        "governance", "republic", "politics", "diplomacy", "civic", "commonwealth", "citizen"
     ]
 }
 
 # Temporal markers by era (approximate publication dates)
 temporal_markers = {
-    "Renaissance": ["thee", "thou", "thy", "hath", "doth", "art", "wert", "hast", "forsooth", "methinks"],
-    "Romanticism/Gothic": ["shall", "upon", "ere", "whilst", "'tis", "thence", "whence", "aught", "naught"],
-    "Victorian": ["should", "would", "ought", "must", "quite", "indeed", "perhaps", "rather"],
-    "Modern": ["isn't", "don't", "can't", "won't", "couldn't", "shouldn't", "wouldn't"]
+    "Renaissance": [
+        "thee", "thou", "thy", "hath", "doth", "art", "wert", "hast", "forsooth", "methinks",
+        "ye", "thine", "tis", "twas", "whence", "thither", "hither", "wherefore", "verily",
+        "maketh", "giveth", "sayeth", "deem", "perchance", "mayhap", "yea", "nay", "prithee"
+    ],
+    "Romanticism/Gothic": [
+        "shall", "upon", "ere", "whilst", "'tis", "thence", "whence", "aught", "naught",
+        "sublime", "o'er", "amidst", "betwixt", "betimes", "anon", "oft", "ofttimes", "oft-times",
+        "withal", "fain", "athwart", "語言", "thither", "yon", "yonder", "alack", "alas"
+    ],
+    "Victorian": [
+        "should", "would", "ought", "must", "quite", "indeed", "perhaps", "rather",
+        "pray", "truly", "certainly", "scarcely", "presently", "particularly", "exceedingly",
+        "remarkably", "decidedly", "tolerably", "uncommonly", "excessively", "prodigiously"
+    ],
+    "Modern": [
+        "isn't", "don't", "can't", "won't", "couldn't", "shouldn't", "wouldn't",
+        "gonna", "gotta", "wanna", "yeah", "nope", "okay", "ok", "stuff", "thing", "like",
+        "whatever", "anyway", "anyhow", "sorta", "kinda", "hell", "damn", "goddamn"
+    ]
 }
 
-# Function to count syllables in a word
+# Function to count syllables in a word with improved accuracy
 def count_syllables(word):
     try:
         word = word.lower().strip()
         if not word:
             return 0
+        
+        special_cases = {
+            'the': 1, 'every': 2, 'different': 3, 'difficult': 3, 'beautiful': 3,
+            'absolutely': 4, 'area': 2, 'business': 2, 'camera': 3, 'poem': 2,
+            'poems': 1, 'through': 1, 'thoroughly': 3, 'thought': 1, 'variable': 4,
+            'society': 3, 'science': 2
+        }
+        
+        if word in special_cases:
+            return special_cases[word]
+        
+        if word.endswith('es') and not word.endswith(('ies', 'ves', 'oes')):
+            word = word[:-2]
+        elif word.endswith('ed') and not word.endswith('ied'):
+            word = word[:-2]
+        
         vowels = 'aeiouy'
         syllable_count = 0
         prev_char_was_vowel = False
-        for char in word:
+        
+        for i, char in enumerate(word):
             is_vowel = char in vowels
-            if is_vowel and not prev_char_was_vowel:
+            
+            if is_vowel and prev_char_was_vowel and i > 0:
+                if word[i-1:i+1] not in ['io', 'ia', 'eo', 'ua', 'uo', 'ie']:
+                    syllable_count += 1
+            elif is_vowel and not prev_char_was_vowel:
                 syllable_count += 1
+                
             prev_char_was_vowel = is_vowel
-        if word.endswith('e') and not word.endswith('le'):
-            syllable_count = max(1, syllable_count - 1)  # Silent 'e'
+        
+        if word.endswith('e') and not word.endswith(('le', 'ie', 'ee', 'oe')):
+            syllable_count = max(1, syllable_count - 1)
+        
         if word.endswith('le') and len(word) > 2 and word[-3] not in vowels:
-            syllable_count += 1  # Handle 'le' as syllable
-        for diphthong in ['ia', 'io', 'ua', 'uo']:
-            if diphthong in word:
-                syllable_count = max(1, syllable_count - 1)
+            syllable_count += 1
+            
+        if word.endswith('y') and len(word) > 1 and word[-2] not in vowels:
+            syllable_count += 1
+        
         return max(1, syllable_count)
     except Exception as e:
         logger.error(f"Error counting syllables for word '{word}': {e}")
         return 1
 
-# Function to calculate readability metrics
+# Enhanced function to calculate readability metrics
 def calculate_readability_metrics(text):
     try:
-        sentences = sent_tokenize(text[:100000])  # Limit for performance
+        sentences = sent_tokenize(text[:100000])
         if not sentences:
             return {
                 "flesch_reading_ease": 0,
                 "gunning_fog": 0,
-                "smog_index": 0
+                "smog_index": 0,
+                "automated_readability_index": 0,
+                "coleman_liau_index": 0
             }
         
-        # Get word counts and syllable counts
         words = []
         for sentence in sentences:
             words.extend([word for word in sentence.split() if word.strip()])
@@ -134,40 +262,46 @@ def calculate_readability_metrics(text):
             return {
                 "flesch_reading_ease": 0,
                 "gunning_fog": 0,
-                "smog_index": 0
+                "smog_index": 0,
+                "automated_readability_index": 0,
+                "coleman_liau_index": 0
             }
         
         word_count = len(words)
         syllable_counts = [count_syllables(word) for word in words]
         complex_words = sum(1 for count in syllable_counts if count > 2)
         
-        # Calculate metrics
+        total_chars = sum(len(word) for word in words)
+        
         avg_sentence_length = word_count / len(sentences)
         avg_syllables_per_word = sum(syllable_counts) / word_count
         
-        # Flesch Reading Ease
         flesch = 206.835 - (1.015 * avg_sentence_length) - (84.6 * avg_syllables_per_word)
-        
-        # Gunning Fog
         gunning_fog = 0.4 * (avg_sentence_length + (100 * complex_words / word_count))
-        
-        # SMOG Index
         smog = 1.043 * np.sqrt(30 * complex_words / len(sentences)) + 3.1291
+        ari = 4.71 * (total_chars / word_count) + 0.5 * (word_count / len(sentences)) - 21.43
+        L = (total_chars / word_count) * 100
+        S = (len(sentences) / word_count) * 100
+        coleman_liau = 0.0588 * L - 0.296 * S - 15.8
         
         return {
             "flesch_reading_ease": flesch,
             "gunning_fog": gunning_fog,
-            "smog_index": smog
+            "smog_index": smog,
+            "automated_readability_index": ari,
+            "coleman_liau_index": coleman_liau
         }
     except Exception as e:
         logger.error(f"Error in readability calculation: {e}")
         return {
             "flesch_reading_ease": 0,
             "gunning_fog": 0,
-            "smog_index": 0
+            "smog_index": 0,
+            "automated_readability_index": 0,
+            "coleman_liau_index": 0
         }
 
-# Function to download and clean Gutenberg text with retry logic
+# Function to download and clean Gutenberg text
 def download_gutenberg_text(gid):
     urls = [
         f"https://www.gutenberg.org/files/{gid}/{gid}-0.txt",
@@ -175,21 +309,29 @@ def download_gutenberg_text(gid):
         f"https://www.gutenberg.org/cache/epub/{gid}/pg{gid}.txt"
     ]
     
-    for attempt in range(3):  # Retry up to 3 times
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    
+    for attempt in range(5):
         for url in urls:
             try:
-                response = requests.get(url, timeout=15)
+                response = requests.get(url, timeout=20, headers=headers)
                 response.raise_for_status()
                 text = response.text
                 
-                # Find and extract the main content
                 start_markers = [
                     "*** START OF THIS PROJECT GUTENBERG EBOOK",
                     "***START OF THE PROJECT GUTENBERG EBOOK",
                     "*** START OF THE PROJECT GUTENBERG EBOOK",
                     "***START OF THIS PROJECT GUTENBERG EBOOK",
                     "START OF THE PROJECT GUTENBERG EBOOK",
-                    "START OF THIS PROJECT GUTENBERG EBOOK"
+                    "START OF THIS PROJECT GUTENBERG EBOOK",
+                    "*** START OF THE PROJECT GUTENBERG",
+                    "*** START OF THIS PROJECT GUTENBERG",
+                    "Produced by",
+                    "Transcribed from",
+                    "This eBook was produced by"
                 ]
                 
                 end_markers = [
@@ -198,15 +340,22 @@ def download_gutenberg_text(gid):
                     "*** END OF THE PROJECT GUTENBERG EBOOK",
                     "***END OF THIS PROJECT GUTENBERG EBOOK",
                     "END OF THE PROJECT GUTENBERG EBOOK",
-                    "END OF THIS PROJECT GUTENBERG EBOOK"
+                    "END OF THIS PROJECT GUTENBERG EBOOK",
+                    "*** END OF THE PROJECT GUTENBERG",
+                    "*** END OF THIS PROJECT GUTENBERG",
+                    "End of Project Gutenberg",
+                    "End of the Project Gutenberg"
                 ]
                 
-                # Find start and end positions
                 start_idx = -1
                 for marker in start_markers:
                     pos = text.find(marker)
                     if pos != -1:
-                        start_idx = pos + len(marker)
+                        line_end = text.find('\n', pos)
+                        if line_end != -1:
+                            start_idx = line_end + 1
+                        else:
+                            start_idx = pos + len(marker)
                         break
                 
                 end_idx = -1
@@ -216,58 +365,72 @@ def download_gutenberg_text(gid):
                         end_idx = pos
                         break
                 
-                # Extract and clean the main content
                 if start_idx != -1 and end_idx != -1:
                     text = text[start_idx:end_idx].strip()
+                elif start_idx != -1:
+                    text = text[start_idx:].strip()
+                elif end_idx != -1:
+                    text = text[:end_idx].strip()
                 
-                # Clean up the text
-                text = re.sub(r'\r\n', '\n', text)  # Normalize line endings
-                text = re.sub(r'\n{2,}', '\n\n', text)  # Normalize paragraph breaks
-                text = re.sub(r'_+', '', text)  # Remove underscores used for emphasis
-                text = re.sub(r'\[.*?\]', '', text)  # Remove footnote references
+                if len(text) > 500000:
+                    chapter_markers = [
+                        "\nCHAPTER I", "\nCHAPTER 1", "\nI.", "\n1.",
+                        "\nPREFACE", "\nINTRODUCTION", "\nFOREWORD"
+                    ]
+                    for marker in chapter_markers:
+                        pos = text.find(marker)
+                        if pos > 1000:
+                            text = text[pos:]
+                            break
                 
-                return text
+                text = re.sub(r'\r\n', '\n', text)
+                text = re.sub(r'\n{3,}', '\n\n', text)
+                text = re.sub(r'_+', '', text)
+                text = re.sub(r'\[.*?\]', '', text)
+                text = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', text)
+                
+                if len(text.split()) > 1000:
+                    return text
+                
             except requests.RequestException as e:
                 logger.warning(f"Failed to download {url}: {e}")
         
-        # Wait before retrying
-        time.sleep(2)
+        sleep_time = 2 * (2 ** attempt)
+        logger.warning(f"Retry {attempt+1}/5, waiting {sleep_time} seconds...")
+        time.sleep(sleep_time)
     
-    logger.error(f"No valid text found for GutenbergID {gid} after 3 attempts")
+    logger.error(f"No valid text found for GutenbergID {gid} after 5 attempts")
     return None
 
-# Function to extract syntactic and narrative features
+# Complete extract_syntactic_features
 def extract_syntactic_features(text):
-    # Tokenize text for basic statistics
-    sentences = sent_tokenize(text[:200000])  # Limit for performance
+    sentences = sent_tokenize(text[:200000])
     if not sentences:
         return {}
     
-    # Get sentence lengths
     sentence_lengths = [len(sent.split()) for sent in sentences]
     
-    # Basic statistics
     avg_sentence_length = np.mean(sentence_lengths) if sentence_lengths else 0
     var_sentence_length = np.var(sentence_lengths) if sentence_lengths else 0
     max_sentence_length = max(sentence_lengths) if sentence_lengths else 0
     median_sentence_length = np.median(sentence_lengths) if sentence_lengths else 0
     
-    # Process a sample of the text with SpaCy for detailed analysis
-    sample_size = min(len(text), 100000)  # Process at most 100K characters
+    sample_size = min(len(text), 100000)
     doc = nlp(text[:sample_size])
     
-    # Count punctuation
+    text_length = max(len(text), 1)
     punctuation_counts = {
-        "exclamation_marks": text.count("!") / max(len(text) / 10000, 1),  # Normalize by 10K chars
-        "question_marks": text.count("?") / max(len(text) / 10000, 1),
-        "semicolons": text.count(";") / max(len(text) / 10000, 1),
-        "colons": text.count(":") / max(len(text) / 10000, 1),
-        "ellipses": text.count("...") / max(len(text) / 10000, 1),
-        "dashes": (text.count("—") + text.count("--")) / max(len(text) / 10000, 1),
-        "parentheses": (text.count("(") + text.count(")")) / max(len(text) / 10000, 1)
+        "exclamation_marks": text.count("!") / (text_length / 10000),
+        "question_marks": text.count("?") / (text_length / 10000),
+        "semicolons": text.count(";") / (text_length / 10000),
+        "colons": text.count(":") / (text_length / 10000),
+        "ellipses": (text.count("...") + text.count(". . .")) / (text_length / 10000),
+        "dashes": (text.count("—") + text.count("--") + text.count("–")) / (text_length / 10000),
+        "parentheses": (text.count("(") + text.count(")")) / (text_length / 10000),
+        "quotation_marks": (text.count('"') + text.count('"') + text.count('"')) / (text_length / 10000),
+        "apostrophes": (text.count("'") + text.count("'") + text.count("'")) / (text_length / 10000)
     }
     
-    # Count parts of speech
     pos_counts = Counter(token.pos_ for token in doc)
     total_tokens = sum(pos_counts.values()) or 1
     
@@ -278,434 +441,389 @@ def extract_syntactic_features(text):
         "adv_freq": pos_counts.get("ADV", 0) / total_tokens * 100,
         "verb_freq": pos_counts.get("VERB", 0) / total_tokens * 100,
         "det_freq": pos_counts.get("DET", 0) / total_tokens * 100,
-        "conj_freq": pos_counts.get("CONJ", 0) / total_tokens * 100,
-        "intj_freq": pos_counts.get("INTJ", 0) / total_tokens * 100
+        "conj_freq": (pos_counts.get("CONJ", 0) + pos_counts.get("CCONJ", 0) + pos_counts.get("SCONJ", 0)) / total_tokens * 100,
+        "intj_freq": pos_counts.get("INTJ", 0) / total_tokens * 100,
+        "prep_freq": pos_counts.get("ADP", 0) / total_tokens * 100,
+        "pron_freq": pos_counts.get("PRON", 0) / total_tokens * 100
     }
     
-    # Calculate verb tense distribution
     verb_tokens = [token for token in doc if token.pos_ == "VERB"]
     verb_features = {}
     if verb_tokens:
-        # Approximating tense - not perfect but gives a signal
         past_verbs = sum(1 for t in verb_tokens if t.tag_ in ["VBD", "VBN"])
         present_verbs = sum(1 for t in verb_tokens if t.tag_ in ["VBZ", "VBP", "VBG"])
+        future_hints = sum(1 for t in doc if t.lower_ in ["will", "shall", "going"])
+        
         verb_features = {
             "past_tense_ratio": past_verbs / len(verb_tokens) * 100,
-            "present_tense_ratio": present_verbs / len(verb_tokens) * 100
+            "present_tense_ratio": present_verbs / len(verb_tokens) * 100,
+            "future_hints_ratio": future_hints / total_tokens * 100
         }
     else:
         verb_features = {
             "past_tense_ratio": 0,
-            "present_tense_ratio": 0
+            "present_tense_ratio": 0,
+            "future_hints_ratio": 0
         }
     
-    # Calculate syllables per word
     words = [token.text for token in doc if token.is_alpha]
     syllable_counts = [count_syllables(word) for word in words]
     avg_syllables_per_word = np.mean(syllable_counts) if syllable_counts else 0
+    polysyllabic_ratio = sum(1 for count in syllable_counts if count > 2) / (len(syllable_counts) or 1) * 100
     
-    # Narrative features
     narrative_markers = {
         "temporal_adverbs": sum(1 for token in doc if token.lower_ in [
             "when", "then", "whilst", "after", "before", "now", "soon", "later",
-            "early", "previously", "subsequently", "immediately", "presently"
+            "early", "previously", "subsequently", "immediately", "presently",
+            "yesterday", "today", "tomorrow", "once", "again", "already", "yet",
+            "still", "always", "never", "ever", "often", "seldom", "rarely"
         ]) / total_tokens * 100,
-        
         "locative_preps": sum(1 for token in doc if token.lower_ in [
             "in", "at", "on", "from", "to", "toward", "between", "among",
-            "within", "throughout", "around", "across", "over", "under"
+            "within", "throughout", "around", "across", "behind", "beyond",
+            "above", "below", "beside", "under", "over", "near", "far",
+            "inside", "outside", "along", "against"
         ]) / total_tokens * 100,
-        
-        "dialogue_markers": (
-            text.count('"') + text.count("'") + 
-            sum(1 for token in doc if token.lower_ in [
-                "said", "asked", "replied", "answered", "exclaimed", "whispered",
-                "shouted", "murmured", "spoke", "uttered", "cried", "responded"
-            ])
-        ) / total_tokens * 100,
-        
-        "conditional_verbs": sum(1 for token in doc if token.lower_ in [
-            "would", "could", "should", "might", "may", "must", "ought"
+        "causal_connectives": sum(1 for token in doc if token.lower_ in [
+            "because", "since", "therefore", "thus", "hence", "consequently",
+            "as", "due", "owing", "resulting"
         ]) / total_tokens * 100,
-        
-        "first_person_pronouns": sum(1 for token in doc if token.lower_ in [
-            "i", "me", "my", "mine", "myself", "we", "us", "our", "ours", "ourselves"
-        ]) / total_tokens * 100,
-        
-        "third_person_pronouns": sum(1 for token in doc if token.lower_ in [
-            "he", "him", "his", "himself", "she", "her", "hers", "herself",
-            "they", "them", "their", "theirs", "themselves"
+        "dialogue_markers": sum(1 for token in doc if token.lower_ in [
+            "said", "say", "says", "replied", "asked", "exclaimed", "whispered",
+            "shouted", "cried", "murmured", "muttered", "answered"
         ]) / total_tokens * 100
     }
     
-    # Calculate readability metrics
-    readability = calculate_readability_metrics(text[:200000])
-    
-    # Calculate sentence structure complexity
-    sentence_fragments = sum(1 for sent in sentences if len(sent.split()) < 5) / len(sentences) * 100
-    complex_sentences = sum(1 for sent in sentences if len(sent.split()) > 30) / len(sentences) * 100
-    
-    # Temporal marker frequencies
-    temporal_markers_features = {}
-    for era, markers in temporal_markers.items():
-        era_key = f"{era.lower()}_markers"
-        text_lower = text.lower()
-        temporal_markers_features[era_key] = sum(text_lower.count(marker) for marker in markers) / max(len(text.split()) / 1000, 1)
-    
-    # Combine all features
     return {
-        # Sentence statistics
         "avg_sentence_length": avg_sentence_length,
         "var_sentence_length": var_sentence_length,
         "max_sentence_length": max_sentence_length,
         "median_sentence_length": median_sentence_length,
-        
-        # Word statistics
-        "avg_syllables_per_word": avg_syllables_per_word,
-        
-        # Punctuation
         **punctuation_counts,
-        
-        # Parts of speech
         **pos_features,
-        
-        # Verb tense
         **verb_features,
-        
-        # Narrative style
-        **narrative_markers,
-        
-        # Readability
-        **readability,
-        
-        # Sentence complexity
-        "sentence_fragments": sentence_fragments,
-        "complex_sentences": complex_sentences,
-        
-        # Temporal markers
-        **temporal_markers_features
+        "avg_syllables_per_word": avg_syllables_per_word,
+        "polysyllabic_ratio": polysyllabic_ratio,
+        **narrative_markers
     }
 
-# Function to extract movement-specific vocabulary features
-def extract_movement_features(text, movement):
-    text_lower = text.lower()
-    movement_features = {}
+# Text preprocessing for feature extraction
+def preprocess_text(text, for_vectorizer=True):
+    """
+    Preprocess text for TF-IDF, topic modeling, or embeddings.
     
-    # Count occurrences of movement-specific terms
-    word_count = len(text.split())
-    for mov, words in movement_specific_features.items():
-        prefix = f"{mov.lower()}_words"
-        # Normalize by word count and scale up for readability
-        movement_features[prefix] = sum(text_lower.count(word) for word in words) / (word_count or 1) * 1000
+    Args:
+        text: Input text
+        for_vectorizer: If True, return a single string for TF-IDF; else, return list of tokens
     
-    # Additional stylistic features
-    doc = nlp(text[:100000])  # Process first 100K characters for efficiency
-    total_tokens = len(doc) or 1
-    
-    # Count capitalized words (not at sentence start)
-    sentences = list(doc.sents)
-    capitalized_words = 0
-    for sent in sentences:
-        sent_tokens = [token for token in sent if token.is_alpha]
-        if len(sent_tokens) > 1:  # Skip single-word sentences
-            capitalized_words += sum(1 for token in sent_tokens[1:] if token.text[0].isupper())
-    
-    movement_features["capitalized_words"] = capitalized_words / total_tokens * 100
-    
-    # Analyze paragraph structure
-    paragraphs = [p for p in text.split('\n\n') if p.strip()]
-    if paragraphs:
-        movement_features["avg_paragraph_length"] = np.mean([len(p.split()) for p in paragraphs])
-        movement_features["var_paragraph_length"] = np.var([len(p.split()) for p in paragraphs])
-    else:
-        movement_features["avg_paragraph_length"] = 0
-        movement_features["var_paragraph_length"] = 0
-    
-    # Measure vocabulary richness
-    words = [token.text.lower() for token in doc if token.is_alpha]
-    unique_words = len(set(words))
-    total_words = len(words)
-    movement_features["type_token_ratio"] = unique_words / (total_words or 1)
-    
-    # Lexical diversity (moving window)
-    if total_words > 1000:
-        window_size = 1000
-        windows = [words[i:i+window_size] for i in range(0, len(words)-window_size, window_size//2)]
-        ttr_windows = [len(set(window)) / len(window) for window in windows]
-        movement_features["mattr"] = np.mean(ttr_windows)  # Moving-Average Type-Token Ratio
-    else:
-        movement_features["mattr"] = movement_features["type_token_ratio"]
-    
-    return movement_features
-
-# Function to get expanded synonyms using WordNet
-def get_expanded_terms(seed_terms, depth=1):
-    expanded_terms = set(seed_terms)
-    
-    for term in seed_terms:
-        # Get WordNet synsets
-        synsets = wordnet.synsets(term)
-        for synset in synsets[:3]:  # Limit to first 3 synsets per term
-            # Add synonyms
-            for lemma in synset.lemmas():
-                expanded_terms.add(lemma.name().lower().replace('_', ' '))
-            
-            # Add hypernyms (one level up)
-            if depth > 0:
-                for hypernym in synset.hypernyms():
-                    for lemma in hypernym.lemmas():
-                        expanded_terms.add(lemma.name().lower().replace('_', ' '))
-    
-    return list(expanded_terms)
-
-# Function to extract semantic features using improved TF-IDF and LDA
-def extract_semantic_features(texts, movements, gids):
-    # Prepare text for vectorization
-    processed_texts = []
-    for text in texts:
-        # Take a sample to speed up processing
-        sample = text[:200000]
-        # Basic cleaning
-        sample = re.sub(r'[^\w\s]', ' ', sample)  # Replace punctuation with space
-        sample = re.sub(r'\s+', ' ', sample).strip()  # Normalize whitespace
-        processed_texts.append(sample)
-    
-    # Expanded movement-specific terms for each movement
-    expanded_terms = {}
-    for movement, terms in movement_specific_features.items():
-        expanded_terms[movement] = get_expanded_terms(terms)
-    
-    # Create movement-specific dictionaries
-    movement_dictionaries = {}
-    for movement, terms in expanded_terms.items():
-        movement_dictionaries[movement] = terms
-    
-    # Create custom TF-IDF with expanded movement-specific vocabulary
-    vocab = set()
-    for terms in movement_dictionaries.values():
-        vocab.update(terms)
-    
-    # Use CountVectorizer for count-based features with custom vocabulary
-    count_vectorizer = CountVectorizer(
-        max_features=300,
-        vocabulary=list(vocab),
-        ngram_range=(1, 2)  # Include bigrams
-    )
-    
-    # Generate count matrix
+    Returns:
+        Preprocessed text or tokens
+    """
     try:
-        count_matrix = count_vectorizer.fit_transform(processed_texts)
-        count_feature_names = count_vectorizer.get_feature_names_out()
+        doc = nlp(text[:100000])  # Limit for performance
+        tokens = []
+        for token in doc:
+            if token.is_alpha and not token.is_stop and token.text.lower() not in stop_words:
+                lemma = lemmatizer.lemmatize(token.text.lower())
+                if len(lemma) > 2:  # Ignore very short tokens
+                    tokens.append(lemma)
         
-        # Normalize counts by document length
-        doc_lengths = count_matrix.sum(axis=1).A1
-        normalized_counts = count_matrix.copy()
-        for i in range(len(processed_texts)):
-            if doc_lengths[i] > 0:
-                normalized_counts[i] = normalized_counts[i] / doc_lengths[i]
-        
-        # TF-IDF for general vocabulary capture
-        tfidf_vectorizer = TfidfVectorizer(
-            max_features=200,
-            stop_words='english',
-            ngram_range=(1, 2),
-            max_df=0.8,
-            min_df=5
-        )
-        
-        tfidf_matrix = tfidf_vectorizer.fit_transform(processed_texts)
-        tfidf_feature_names = tfidf_vectorizer.get_feature_names_out()
-        
-        # LDA topic modeling
-        processed_tokens = []
-        for text in processed_texts:
-            tokens = [word for word in text.lower().split() if word not in stop_words and len(word) > 2]
-            processed_tokens.append(tokens)
-        
-        dictionary = corpora.Dictionary(processed_tokens)
-        corpus = [dictionary.doc2bow(text) for text in processed_tokens]
-        
-        n_topics = min(15, len(processed_texts) // 5)  # Scale topics with dataset size
-        lda = LdaModel(
-            corpus=corpus,
-            id2word=dictionary,
-            num_topics=n_topics,
-            passes=10,
-            alpha='auto',
-            random_state=42
-        )
-        
-        # Extract topic distributions
-        topic_distributions = []
-        for bow in corpus:
-            topics = lda[bow]
-            topic_vec = [0] * n_topics
-            for topic_id, weight in topics:
-                topic_vec[topic_id] = weight
-            topic_distributions.append(topic_vec)
-        
-        # Calculate movement-specific term frequencies
-        movement_term_freqs = []
-        for text in processed_texts:
-            text_lower = text.lower()
-            movement_freqs = {}
-            total_words = len(text_lower.split())
-            for movement, terms in movement_dictionaries.items():
-                term_count = sum(text_lower.count(term) for term in terms)
-                movement_freqs[f"{movement.lower()}_term_freq"] = term_count / (total_words or 1) * 1000
-            movement_term_freqs.append(movement_freqs)
-        
-        # Combine features
-        feature_matrices = [
-            normalized_counts.toarray(),  # Movement-specific vocabulary counts
-            tfidf_matrix.toarray(),       # General TF-IDF features
-            np.array(topic_distributions)  # Topic distributions
-        ]
-        
-        feature_matrix = np.hstack(feature_matrices)
-        
-        # Generate feature names
-        feature_names = (
-            [f"count_{name}" for name in count_feature_names] +
-            [f"tfidf_{name}" for name in tfidf_feature_names] +
-            [f"topic_{i}" for i in range(n_topics)]
-        )
-        
-        # Movement-term frequencies
-        movement_term_matrix = []
-        for freqs in movement_term_freqs:
-            movement_term_matrix.append([freqs.get(f"{movement.lower()}_term_freq", 0) for movement in movement_specific_features])
-        
-        movement_term_matrix = np.array(movement_term_matrix)
-        movement_term_names = [f"{movement.lower()}_term_freq" for movement in movement_specific_features]
-        
-        # Add movement term frequencies to feature matrix
-        full_feature_matrix = np.hstack([feature_matrix, movement_term_matrix])
-        full_feature_names = feature_names + movement_term_names
-        
-        return full_feature_matrix, full_feature_names
-    
+        if for_vectorizer:
+            return " ".join(tokens)
+        return tokens
     except Exception as e:
-        logger.error(f"Error in semantic feature extraction: {e}")
-        return np.zeros((len(processed_texts), 1)), ["error"]
+        logger.error(f"Error preprocessing text: {e}")
+        return "" if for_vectorizer else []
 
-# Main processing function
-def main():
-    # Create output directory for intermediate files
-    os.makedirs("data", exist_ok=True)
+# Extract TF-IDF features
+def extract_tfidf_features(texts, max_features=1000):
+    """
+    Extract TF-IDF features from a list of texts.
     
-    # Load dataset
+    Args:
+        texts: List of preprocessed texts
+        max_features: Maximum number of features to keep
+    
+    Returns:
+        Feature matrix, feature names, vectorizer
+    """
     try:
-        data_df = pd.read_csv("data/data.csv")
-    except FileNotFoundError:
-        logger.error("data/data.csv not found. Please ensure the file exists.")
-        exit(1)
+        vectorizer = TfidfVectorizer(max_features=max_features, ngram_range=(1, 2), min_df=2)
+        X = vectorizer.fit_transform(texts)
+        return X.toarray(), vectorizer.get_feature_names_out(), vectorizer
+    except Exception as e:
+        logger.error(f"Error in TF-IDF extraction: {e}")
+        return np.zeros((len(texts), max_features)), [], None
+
+# Extract LDA topic features
+def extract_lda_features(texts, num_topics=10):
+    """
+    Extract LDA topic probabilities as features.
     
-    # Filter out non-prose works if needed
-    if "IsProse" in data_df.columns:
-        data_df = data_df[data_df["IsProse"] == True]
+    Args:
+        texts: List of tokenized texts
+        num_topics: Number of topics
     
-    # Check if any cached texts exist
-    cache_dir = os.path.join("data", "text_cache")
-    os.makedirs(cache_dir, exist_ok=True)
+    Returns:
+        Topic probability matrix
+    """
+    try:
+        dictionary = corpora.Dictionary(texts)
+        dictionary.filter_extremes(no_below=2, no_above=0.5)
+        corpus = [dictionary.doc2bow(text) for text in texts]
+        lda = LdaModel(corpus, num_topics=num_topics, id2word=dictionary, passes=10, random_state=42)
+        topic_probs = np.zeros((len(texts), num_topics))
+        for i, doc in enumerate(corpus):
+            topics = lda[doc]
+            for topic_id, prob in topics:
+                topic_probs[i, topic_id] = prob
+        return topic_probs
+    except Exception as e:
+        logger.error(f"Error in LDA extraction: {e}")
+        return np.zeros((len(texts), num_topics))
+
+# Extract NMF topic features
+def extract_nmf_features(texts, num_topics=10):
+    """
+    Extract NMF topic features.
     
-    # Process texts and extract features
-    logger.info("Starting feature extraction process...")
-    features_list = []
-    texts = []
-    gids = []
-    movements = []
-    authors = []
-    titles = []
+    Args:
+        texts: List of preprocessed texts
+        num_topics: Number of topics
     
-    # Process texts in parallel
-    def process_text(row):
-        gid = row['GutenbergID']
-        title = row['Title']
-        movement = row['Movement']
-        author = row['Author']
+    Returns:
+        Topic feature matrix
+    """
+    try:
+        vectorizer = TfidfVectorizer(max_features=1000, min_df=2)
+        X = vectorizer.fit_transform(texts)
+        nmf = NMF(n_components=num_topics, random_state=42)
+        W = nmf.fit_transform(X)
+        return W
+    except Exception as e:
+        logger.error(f"Error in NMF extraction: {e}")
+        return np.zeros((len(texts), num_topics))
+
+# Extract word embeddings (Word2Vec)
+def extract_word2vec_features(texts, vector_size=100):
+    """
+    Extract mean Word2Vec vectors for each text.
+    
+    Args:
+        texts: List of tokenized texts
+        vector_size: Size of embedding vectors
+    
+    Returns:
+        Mean embedding matrix
+    """
+    try:
+        model = Word2Vec(sentences=texts, vector_size=vector_size, window=5, min_count=2, workers=4, seed=42)
+        embeddings = np.zeros((len(texts), vector_size))
+        for i, tokens in enumerate(texts):
+            valid_tokens = [t for t in tokens if t in model.wv]
+            if valid_tokens:
+                embeddings[i] = np.mean([model.wv[t] for t in valid_tokens], axis=0)
+        return embeddings
+    except Exception as e:
+        logger.error(f"Error in Word2Vec extraction: {e}")
+        return np.zeros((len(texts), vector_size))
+
+# Extract movement-specific term frequencies
+def extract_movement_term_features(text):
+    """
+    Count frequencies of movement-specific terms.
+    
+    Args:
+        text: Input text
+    
+    Returns:
+        Dictionary of term frequencies
+    """
+    features = {}
+    doc = nlp(text[:100000])
+    tokens = [token.text.lower() for token in doc if token.is_alpha]
+    total_tokens = len(tokens) or 1
+    
+    for movement, terms in movement_specific_features.items():
+        term_count = sum(tokens.count(term) for term in terms)
+        features[f"{movement}_term_freq"] = term_count / total_tokens * 100
+    
+    return features
+
+# Extract temporal marker frequencies
+def extract_temporal_features(text):
+    """
+    Count frequencies of temporal markers.
+    
+    Args:
+        text: Input text
+    
+    Returns:
+        Dictionary of marker frequencies
+    """
+    features = {}
+    doc = nlp(text[:100000])
+    tokens = [token.text.lower() for token in doc if token.is_alpha]
+    total_tokens = len(tokens) or 1
+    
+    for era, markers in temporal_markers.items():
+        marker_count = sum(tokens.count(marker) for marker in markers)
+        features[f"{era}_marker_freq"] = marker_count / total_tokens * 100
+    
+    return features
+
+# Feature selection
+def select_features(X, y, feature_names, k=500):
+    """
+    Select top k features using multiple methods.
+    
+    Args:
+        X: Feature matrix
+        y: Labels
+        feature_names: List of feature names
+        k: Number of features to select
+    
+    Returns:
+        Selected feature matrix, selected feature names
+    """
+    try:
+        selector_chi2 = SelectKBest(chi2, k=k//3)
+        selector_mi = SelectKBest(mutual_info_classif, k=k//3)
+        selector_f = SelectKBest(f_classif, k=k//3)
         
-        cache_file = os.path.join(cache_dir, f"{gid}.txt")
+        X_chi2 = selector_chi2.fit_transform(X, y)
+        X_mi = selector_mi.fit_transform(X, y)
+        X_f = selector_f.fit_transform(X, y)
         
-        # Check if text is cached
-        if os.path.exists(cache_file):
-            with open(cache_file, 'r', encoding='utf-8', errors='replace') as f:
-                text = f.read()
-            logger.info(f"Loaded cached text for {title} (GutenbergID: {gid})")
-        else:
-            # Download text
-            logger.info(f"Downloading {title} (GutenbergID: {gid}) by {author}...")
-            text = download_gutenberg_text(gid)
-            if text:
-                # Cache the text
-                with open(cache_file, 'w', encoding='utf-8') as f:
-                    f.write(text)
-            else:
-                return None
+        chi2_mask = selector_chi2.get_support()
+        mi_mask = selector_mi.get_support()
+        f_mask = selector_f.get_support()
+        
+        selected_mask = np.logical_or(np.logical_or(chi2_mask, mi_mask), f_mask)
+        selected_features = X[:, selected_mask]
+        selected_names = feature_names[selected_mask]
+        
+        return selected_features, selected_names
+    except Exception as e:
+        logger.error(f"Error in feature selection: {e}")
+        return X, feature_names
+
+# Main function to process texts and extract features
+def process_texts(metadata_file, output_file="text_features.csv", max_texts=None):
+    """
+    Process texts and extract features, saving to CSV.
+    
+    Args:
+        metadata_file: CSV file with GutenbergID, Author, Movement
+        output_file: Output CSV file
+        max_texts: Maximum number of texts to process (for testing)
+    """
+    try:
+        # Load metadata
+        df = pd.read_csv(metadata_file)
+        if max_texts:
+            df = df[:max_texts]
+        
+        logger.info(f"Processing {len(df)} texts")
+        
+        # Download texts in parallel
+        texts = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_gid = {executor.submit(download_gutenberg_text, row['GutenbergID']): row['GutenbergID'] for _, row in df.iterrows()}
+            for future in as_completed(future_to_gid):
+                gid = future_to_gid[future]
+                try:
+                    text = future.result()
+                    if text:
+                        texts.append(text)
+                        logger.info(f"Downloaded text for GutenbergID {gid}")
+                    else:
+                        texts.append("")
+                        logger.warning(f"Failed to download text for GutenbergID {gid}")
+                except Exception as e:
+                    texts.append("")
+                    logger.error(f"Error downloading text for GutenbergID {gid}: {e}")
+        
+        # Preprocess texts
+        preprocessed_texts = [preprocess_text(text, for_vectorizer=True) for text in texts]
+        tokenized_texts = [preprocess_text(text, for_vectorizer=False) for text in texts]
         
         # Extract features
-        syntactic_features = extract_syntactic_features(text)
-        movement_features = extract_movement_features(text, movement)
+        features = []
+        feature_names = []
         
-        return {
-            'gid': gid,
-            'title': title,
-            'movement': movement,
-            'author': author,
-            'text': text,
-            'features': {**syntactic_features, **movement_features}
-        }
-    
-    # Process in parallel with thread pool
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_row = {executor.submit(process_text, row): row for _, row in data_df.iterrows()}
-        for future in as_completed(future_to_row):
-            result = future.result()
-            if result:
-                texts.append(result['text'])
-                gids.append(result['gid'])
-                movements.append(result['movement'])
-                authors.append(result['author'])
-                titles.append(result['title'])
-                features_list.append(result['features'])
-    
-    # Extract semantic features
-    logger.info("Extracting semantic features...")
-    semantic_matrix, semantic_feature_names = extract_semantic_features(texts, movements, gids)
-    
-    # Reduce semantic features to ~82 to total 120 features
-    target_semantic_features = 82
-    if semantic_matrix.shape[1] > target_semantic_features:
-        logger.info(f"Reducing {semantic_matrix.shape[1]} semantic features to {target_semantic_features}...")
-        selector = SelectKBest(score_func=mutual_info_classif, k=target_semantic_features)
-        semantic_matrix = selector.fit_transform(semantic_matrix, movements)
-        selected_indices = selector.get_support()
-        semantic_feature_names = [semantic_feature_names[i] for i in range(len(semantic_feature_names)) if selected_indices[i]]
-    
-    # Combine all features
-    logger.info("Combining features...")
-    feature_df = pd.DataFrame(features_list)
-    semantic_df = pd.DataFrame(semantic_matrix, columns=semantic_feature_names)
-
-    # Create final DataFrame
-    final_df = pd.concat([
-        pd.DataFrame({
-            'GutenbergID': gids,
-            'Author': authors,
-            'Movement': movements
-        }),
-        feature_df,
-        semantic_df
-    ], axis=1)
-    
-    # Remove any duplicate GutenbergIDs
-    final_df = final_df.drop_duplicates(subset=['GutenbergID'])
-    
-    # Save to CSV
-    output_path = "text_features.csv"
-    final_df.to_csv(output_path, index=False)
-    logger.info(f"Feature extraction complete. Saved {len(final_df)} samples to {output_path}")
-    logger.info(f"Total features: {len(final_df.columns) - 3}")  # Subtract GutenbergID, Author, Movement
+        # TF-IDF features
+        tfidf_features, tfidf_names, tfidf_vectorizer = extract_tfidf_features(preprocessed_texts)
+        features.append(tfidf_features)
+        feature_names.extend([f"tfidf_{name}" for name in tfidf_names])
+        
+        # LDA features
+        lda_features = extract_lda_features(tokenized_texts)
+        features.append(lda_features)
+        feature_names.extend([f"lda_topic_{i}" for i in range(lda_features.shape[1])])
+        
+        # NMF features
+        nmf_features = extract_nmf_features(preprocessed_texts)
+        features.append(nmf_features)
+        feature_names.extend([f"nmf_topic_{i}" for i in range(nmf_features.shape[1])])
+        
+        # Word2Vec features
+        w2v_features = extract_word2vec_features(tokenized_texts)
+        features.append(w2v_features)
+        feature_names.extend([f"w2v_{i}" for i in range(w2v_features.shape[1])])
+        
+        # Per-text features
+        for i, text in enumerate(texts):
+            if not text:
+                continue
+            text_features = {}
+            
+            # Readability metrics
+            text_features.update(calculate_readability_metrics(text))
+            
+            # Syntactic features
+            text_features.update(extract_syntactic_features(text))
+            
+            # Movement-specific terms
+            text_features.update(extract_movement_term_features(text))
+            
+            # Temporal markers
+            text_features.update(extract_temporal_features(text))
+            
+            features.append(np.array([list(text_features.values())]))
+            if i == 0:
+                feature_names.extend(list(text_features.keys()))
+        
+        # Combine features
+        X = np.hstack([f for f in features if f.shape[0] == len(texts)])
+        
+        # Feature selection
+        y = df['Movement'].values
+        X_selected, selected_names = select_features(X, y, np.array(feature_names))
+        
+        # Create DataFrame
+        feature_df = pd.DataFrame(X_selected, columns=selected_names)
+        feature_df['GutenbergID'] = df['GutenbergID']
+        feature_df['Author'] = df['Author']
+        feature_df['Movement'] = df['Movement']
+        
+        # Save to CSV
+        feature_df.to_csv(output_file, index=False)
+        logger.info(f"Saved features to {output_file}")
+        
+        # Save vectorizer for future use
+        with open('tfidf_vectorizer.pkl', 'wb') as f:
+            pickle.dump(tfidf_vectorizer, f)
+        
+    except Exception as e:
+        logger.error(f"Error in processing texts: {e}")
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Extract features from Gutenberg texts")
+    parser.add_argument('--metadata', type=str, default='data/data.csv', help='Path to metadata CSV')
+    parser.add_argument('--output', type=str, default='text_features.csv', help='Output CSV file')
+    parser.add_argument('--max_texts', type=int, default=None, help='Maximum number of texts to process')
+    args = parser.parse_args()
+    
+    process_texts(args.metadata, args.output, args.max_texts)
