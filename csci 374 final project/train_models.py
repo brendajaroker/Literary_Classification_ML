@@ -2,8 +2,8 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
-from sklearn.preprocessing import StandardScaler, LabelEncoder, RobustScaler
+from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold, cross_val_score
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
 from sklearn.neighbors import KNeighborsClassifier
@@ -12,10 +12,9 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, silhouette_score
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-from sklearn.feature_selection import SelectKBest, mutual_info_classif
-from sklearn.experimental import enable_iterative_imputer
-from sklearn.impute import IterativeImputer
-from imblearn.over_sampling import SMOTE
+from sklearn.pipeline import Pipeline
+from sklearn.feature_selection import SelectFromModel, SelectKBest, f_classif
+from sklearn.metrics.pairwise import pairwise_distances
 import argparse
 import os
 import warnings
@@ -45,16 +44,12 @@ def parse_arguments():
     parser.add_argument('--visualize', action='store_true',
                         help='Generate visualization plots')
     parser.add_argument('--feature_selection', type=str, default='selectkbest',
-                        choices=['pca', 'selectkbest', 'none'],
+                        choices=['pca', 'selectkbest', 'model_based', 'none'],
                         help='Feature selection method to use')
     parser.add_argument('--n_features', type=int, default=50,
                         help='Number of features to select with SelectKBest')
     parser.add_argument('--use_ensemble', action='store_true', default=True,
                         help='Use ensemble modeling for better performance')
-    parser.add_argument('--use_smote', action='store_true', default=True,
-                        help='Use SMOTE for class balancing')
-    parser.add_argument('--cross_fold', type=int, default=5,
-                        help='Number of cross-validation folds')
     return parser.parse_args()
 
 def load_and_preprocess_data(data_path, random_state):
@@ -73,22 +68,17 @@ def load_and_preprocess_data(data_path, random_state):
     
     print(df['Movement'].value_counts())
     
+    # Handle outliers, extreme values
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     numeric_cols = [col for col in numeric_cols if col not in ['GutenbergID']]
     
+    # Detect and handle outliers using IQR method
     for col in numeric_cols:
-        if (df[col] <= 0).any():
-            continue
-        skew = df[col].skew()
-        if abs(skew) > 1.5:
-            df[col] = np.log1p(df[col])
-    
-    for col in numeric_cols:
-        Q1 = df[col].quantile(0.1)
-        Q3 = df[col].quantile(0.9)
+        Q1 = df[col].quantile(0.25)
+        Q3 = df[col].quantile(0.75)
         IQR = Q3 - Q1
-        lower_bound = Q1 - 2.5 * IQR
-        upper_bound = Q3 + 2.5 * IQR
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
         df[col] = np.where(df[col] < lower_bound, lower_bound, df[col])
         df[col] = np.where(df[col] > upper_bound, upper_bound, df[col])
     
@@ -101,66 +91,35 @@ def load_and_preprocess_data(data_path, random_state):
     feature_names = X.columns.values
     movement_names = le.classes_
     
-    imputer = IterativeImputer(random_state=random_state)
-    X = pd.DataFrame(imputer.fit_transform(X), columns=X.columns)
+    X = X.fillna(0)
     
-    X_interact = create_interaction_terms(X, top_n=5)
-    X_polynomial = create_polynomial_features(X, top_n=5)
-    X_ratio = create_ratio_features(X, top_n=5)
-    
-    X = pd.concat([X, X_interact, X_polynomial, X_ratio], axis=1)
-    feature_names = X.columns.values
-    
-    X = add_statistical_features(X)
-    feature_names = X.columns.values
+    # Create additional higher-order features
+    if X.shape[1] < 100:  # Only create interaction terms if we don't have too many features
+        X_interact = create_interaction_terms(X)
+        X = pd.concat([X, X_interact], axis=1)
+        feature_names = X.columns.values
     
     return X, y_encoded, feature_names, movement_names, df
 
-def create_interaction_terms(X, top_n=5):
+def create_interaction_terms(X, top_n=10):
     """Create interaction terms for the top features"""
+    # For simplicity, let's create interactions between all features
     X_new = pd.DataFrame()
+    
+    # Variance as a simple feature importance metric
     variances = X.var().sort_values(ascending=False)
     top_features = variances.index[:top_n]
+    
+    # Create interactions between top features
     for i, feat1 in enumerate(top_features):
         for feat2 in top_features[i+1:]:
             X_new[f'{feat1}_x_{feat2}'] = X[feat1] * X[feat2]
+    
     return X_new
-
-def create_polynomial_features(X, top_n=5):
-    """Create polynomial features for the top features"""
-    X_new = pd.DataFrame()
-    variances = X.var().sort_values(ascending=False)
-    top_features = variances.index[:top_n]
-    for feat in top_features:
-        X_new[f'{feat}_squared'] = X[feat] ** 2
-    return X_new
-
-def create_ratio_features(X, top_n=5):
-    """Create ratio features for the top features"""
-    X_new = pd.DataFrame()
-    variances = X.var().sort_values(ascending=False)
-    top_features = variances.index[:top_n]
-    for i, feat1 in enumerate(top_features):
-        for feat2 in top_features[i+1:]:
-            denominator = X[feat2] + 1e-10
-            X_new[f'{feat1}_div_{feat2}'] = X[feat1] / denominator
-    return X_new
-
-def add_statistical_features(X):
-    """Add statistical aggregation features"""
-    X = X.copy()
-    numeric_cols = X.select_dtypes(include=[np.number]).columns
-    X['mean_all'] = X[numeric_cols].mean(axis=1)
-    X['std_all'] = X[numeric_cols].std(axis=1)
-    X['median_all'] = X[numeric_cols].median(axis=1)
-    X['max_all'] = X[numeric_cols].max(axis=1)
-    X['min_all'] = X[numeric_cols].min(axis=1)
-    X['range_all'] = X['max_all'] - X['min_all']
-    return X
 
 def create_data_splits(X, y, test_size, val_size, random_state):
     """
-    Create train/validation/test splits with stratification.
+    Create train/validation/test splits.
     
     Args:
         X: Features
@@ -189,20 +148,21 @@ def create_data_splits(X, y, test_size, val_size, random_state):
 
 def scale_features(X_train, X_val, X_test):
     """
-    Scale features using RobustScaler for better handling of outliers.
+    Scale features using StandardScaler and clip extreme values.
     
     Args:
         X_train, X_val, X_test: Data splits
     
     Returns:
-        Scaled data
+        Scaled and clipped data
     """
-    scaler = RobustScaler()
+    scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_val_scaled = scaler.transform(X_val)
     X_test_scaled = scaler.transform(X_test)
     
-    clip_bounds = (-10, 10)
+    # Clip extreme values to ensure stable distances for KNN
+    clip_bounds = (-5, 5)
     X_train_scaled = np.clip(X_train_scaled, clip_bounds[0], clip_bounds[1])
     X_val_scaled = np.clip(X_val_scaled, clip_bounds[0], clip_bounds[1])
     X_test_scaled = np.clip(X_test_scaled, clip_bounds[0], clip_bounds[1])
@@ -217,9 +177,9 @@ def apply_feature_selection(X_train_scaled, X_val_scaled, X_test_scaled, y_train
     Args:
         X_train_scaled, X_val_scaled, X_test_scaled: Scaled data
         y_train: Training labels
-        method: Feature selection method
-        n_components: Number of components (if method is 'pca')
-        n_features: Number of features to select
+        method: Feature selection method ('pca', 'selectkbest', 'model_based', 'none')
+        n_components: Number of PCA components (if method is 'pca')
+        n_features: Number of features to select (if method is 'selectkbest')
         random_state: Random seed
     
     Returns:
@@ -242,46 +202,32 @@ def apply_feature_selection(X_train_scaled, X_val_scaled, X_test_scaled, y_train
         
     elif method == 'selectkbest':
         n_features = min(n_features, X_train_scaled.shape[1])
-        selector = SelectKBest(mutual_info_classif, k=n_features)
+        selector = SelectKBest(f_classif, k=n_features)
         X_train_reduced = selector.fit_transform(X_train_scaled, y_train)
         X_val_reduced = selector.transform(X_val_scaled)
         X_test_reduced = selector.transform(X_test_scaled)
         
-        print(f"Selected {n_features} best features using mutual information")
+        print(f"Selected {n_features} best features using ANOVA F-value")
+        
+        return X_train_reduced, X_val_reduced, X_test_reduced, selector
+        
+    elif method == 'model_based':
+        selector = SelectFromModel(
+            RandomForestClassifier(n_estimators=200, random_state=random_state),
+            threshold='median'
+        )
+        X_train_reduced = selector.fit_transform(X_train_scaled, y_train)
+        X_val_reduced = selector.transform(X_val_scaled)
+        X_test_reduced = selector.transform(X_test_scaled)
+        
+        print(f"Selected {X_train_reduced.shape[1]} features using model-based selection")
         
         return X_train_reduced, X_val_reduced, X_test_reduced, selector
     
     else:
         raise ValueError(f"Unknown feature selection method: {method}")
 
-def apply_smote(X_train, y_train, random_state):
-    """
-    Apply SMOTE to address class imbalance, oversampling minority classes only.
-    
-    Args:
-        X_train: Training features
-        y_train: Training labels
-        random_state: Random seed
-    
-    Returns:
-        Resampled training data
-    """
-    class_counts = np.bincount(y_train)
-    min_class_count = np.min(class_counts)
-    k_neighbors = min(min_class_count - 1, 5)
-    
-    sampler = SMOTE(sampling_strategy='not majority', random_state=random_state, k_neighbors=k_neighbors)
-    X_resampled, y_resampled = sampler.fit_resample(X_train, y_train)
-    print(f"Applied SMOTE resampling: {X_resampled.shape[0]} samples (from {X_train.shape[0]})")
-    
-    print("Class distribution after resampling:")
-    for i, count in enumerate(np.bincount(y_resampled)):
-        print(f"Class {i}: {count}")
-    
-    return X_resampled, y_resampled
-
-def train_supervised_models(X_train, y_train, X_val, y_val, random_state, cross_fold=5, 
-                           use_ensemble=False, use_stacking=False):
+def train_supervised_models(X_train, y_train, X_val, y_val, random_state, use_ensemble=False):
     """
     Train supervised models with GridSearchCV.
     
@@ -289,23 +235,25 @@ def train_supervised_models(X_train, y_train, X_val, y_val, random_state, cross_
         X_train, y_train: Training data
         X_val, y_val: Validation data
         random_state: Random seed
-        cross_fold: Number of cross-validation folds
         use_ensemble: Whether to use ensemble modeling
-        use_stacking: Whether to use stacking instead of voting
     
     Returns:
         Dictionary of trained models
     """
     models = {}
     
+    # Custom weights function for KNN to handle class imbalance
     def class_weighted_distance(X, y):
         def _weight_func(distances):
             weights = np.ones_like(distances)
+            # Compute class frequencies
             class_counts = np.bincount(y, minlength=len(np.unique(y)))
-            class_weights = 1.0 / (class_counts + 1e-10)
+            class_weights = 1.0 / (class_counts + 1e-10)  # Inverse frequency
             for i, dist in enumerate(distances):
-                neighbor_indices = np.argsort(dist)[:min(len(dist), 31)]
+                # Get neighbor indices
+                neighbor_indices = np.argsort(dist)[:min(len(dist), 31)]  # Use up to 31 neighbors
                 neighbor_classes = y[neighbor_indices]
+                # Assign weights based on class frequency
                 for j, idx in enumerate(neighbor_indices):
                     weights[i, j] *= class_weights[neighbor_classes[j]]
             return weights
@@ -315,44 +263,46 @@ def train_supervised_models(X_train, y_train, X_val, y_val, random_state, cross_
         'logistic': {
             'model': LogisticRegression(max_iter=10000, random_state=random_state),
             'params': {
-                'C': [0.01, 0.1, 1, 10],
-                'solver': ['lbfgs', 'saga'],
+                'C': [0.001, 0.01, 0.1, 1, 10, 100, 1000],
+                'solver': ['liblinear', 'lbfgs', 'saga'],
                 'class_weight': [None, 'balanced']
             }
         },
         'random_forest': {
             'model': RandomForestClassifier(random_state=random_state),
             'params': {
-                'n_estimators': [200, 500],
-                'max_depth': [None, 20, 50],
-                'min_samples_split': [2, 5],
-                'class_weight': ['balanced']
+                'n_estimators': [100, 200, 300, 500],
+                'max_depth': [None, 10, 20, 30, 50],
+                'min_samples_split': [2, 5, 10],
+                'min_samples_leaf': [1, 2, 4],
+                'class_weight': [None, 'balanced', 'balanced_subsample']
             }
         },
         'knn': {
             'model': KNeighborsClassifier(),
             'params': {
-                'n_neighbors': [3, 5, 7, 11, 15, 21],
-                'weights': ['distance', class_weighted_distance(X_train, y_train)],
-                'metric': ['cosine', 'manhattan']
+                'n_neighbors': [3, 5, 7, 11, 15, 21, 25, 31],
+                'weights': ['uniform', 'distance', class_weighted_distance(X_train, y_train)],
+                'metric': ['euclidean', 'manhattan', 'cosine'],
+                'p': [1, 2]  # Only used for minkowski, included for completeness
             }
         },
         'gradient_boosting': {
             'model': GradientBoostingClassifier(random_state=random_state),
             'params': {
-                'n_estimators': [200, 500],
-                'max_depth': [3, 5, 7],
-                'learning_rate': [0.01, 0.05, 0.1],
-                'subsample': [0.8, 1.0]
+                'n_estimators': [100, 200, 300, 500],
+                'max_depth': [3, 5, 7, 10],
+                'learning_rate': [0.01, 0.05, 0.1, 0.2],
+                'subsample': [0.8, 0.9, 1.0]
             }
         },
         'svm': {
             'model': SVC(random_state=random_state, probability=True),
             'params': {
                 'C': [0.1, 1, 10, 100],
-                'kernel': ['rbf', 'poly'],
-                'gamma': ['scale', 'auto', 0.01, 0.1],
-                'class_weight': ['balanced']
+                'kernel': ['linear', 'rbf', 'poly'],
+                'gamma': ['scale', 'auto', 0.1, 1],
+                'class_weight': [None, 'balanced']
             }
         }
     }
@@ -362,10 +312,7 @@ def train_supervised_models(X_train, y_train, X_val, y_val, random_state, cross_
         model = model_info['model']
         params = model_info['params']
         
-        if X_train.shape[0] != y_train.shape[0]:
-            raise ValueError(f"X_train ({X_train.shape[0]}) and y_train ({y_train.shape[0]}) have inconsistent sample counts")
-        
-        cv = StratifiedKFold(n_splits=cross_fold, shuffle=True, random_state=random_state)
+        cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=random_state)
         
         grid_search = GridSearchCV(
             model, params, cv=cv, scoring='accuracy', n_jobs=-1, verbose=1
@@ -388,20 +335,22 @@ def train_supervised_models(X_train, y_train, X_val, y_val, random_state, cross_
     
     if use_ensemble:
         print("\nTraining ensemble model...")
+        # Use the top performing models for the ensemble
         sorted_models = sorted(models.items(), key=lambda x: x[1]['val_accuracy'], reverse=True)
-        top_models = sorted_models[:3]
+        top_models = sorted_models[:3]  # Use top 3 models
         
         estimators = [(name, model_dict['model']) for name, model_dict in top_models]
         
-        ensemble = VotingClassifier(estimators=estimators, voting='soft', n_jobs=-1)
+        # Create and train ensemble model (soft voting)
+        ensemble = VotingClassifier(estimators=estimators, voting='soft')
         ensemble.fit(X_train, y_train)
         
         val_accuracy = ensemble.score(X_val, y_val)
-        print(f"Ensemble (voting) validation accuracy: {val_accuracy:.4f}")
+        print(f"Ensemble validation accuracy: {val_accuracy:.4f}")
         
         models['ensemble'] = {
             'model': ensemble,
-            'params': {'estimators': [name for name, _ in estimators], 'stacking': False},
+            'params': {'estimators': [name for name, _ in estimators]},
             'val_accuracy': val_accuracy
         }
     
@@ -467,14 +416,17 @@ def evaluate_models_on_test_set(models, kmeans, X_train, y_train, X_test, y_test
             'report': classification_report(y_test, y_pred, target_names=movement_names, output_dict=True)
         }
     
+    # Map clusters to labels using training data
     cluster_to_label = {}
     for cluster in range(kmeans.n_clusters):
         train_indices = np.where(kmeans.labels_ == cluster)[0]
         if len(train_indices) > 0:
             cluster_to_label[cluster] = np.bincount(y_train[train_indices]).argmax()
         else:
+            # Fallback: assign a default label if cluster is empty
             cluster_to_label[cluster] = 0
     
+    # Evaluate K-means on test set
     kmeans_preds = np.array([cluster_to_label.get(label, 0) for label in kmeans.predict(X_test)])
     kmeans_accuracy = accuracy_score(y_test, kmeans_preds)
     
@@ -492,7 +444,7 @@ def evaluate_models_on_test_set(models, kmeans, X_train, y_train, X_test, y_test
     return results
 
 def create_visualizations(X_train, y_train, kmeans, X_test, y_test, movement_names, 
-                         results, output_dir, random_state, models, feature_names, feature_selector=None):
+                         results, output_dir, random_state, models, feature_names, pca_obj=None):
     """
     Create visualizations of the results.
     
@@ -506,13 +458,14 @@ def create_visualizations(X_train, y_train, kmeans, X_test, y_test, movement_nam
         random_state: Random seed
         models: Dictionary of trained models
         feature_names: Names of features
-        feature_selector: Feature selection object
+        pca_obj: PCA object if PCA was used for dimensionality reduction
     """
     viz_dir = os.path.join(output_dir, 'visualizations')
     os.makedirs(viz_dir, exist_ok=True)
     
     print("\nGenerating t-SNE visualization...")
-    if X_train.shape[1] > 50:
+    # If we have high-dimensional data, run PCA first to speed up t-SNE
+    if X_train.shape[1] > 50 and pca_obj is None:
         pca_tsne = PCA(n_components=50, random_state=random_state)
         X_train_pca = pca_tsne.fit_transform(X_train)
         X_test_pca = pca_tsne.transform(X_test)
@@ -521,7 +474,7 @@ def create_visualizations(X_train, y_train, kmeans, X_test, y_test, movement_nam
         X_test_pca = X_test
     
     tsne = TSNE(n_components=2, random_state=random_state, perplexity=min(30, X_train.shape[0]//5), 
-                learning_rate='auto', init='pca')
+               learning_rate='auto', init='pca')
     X_tsne = tsne.fit_transform(np.vstack([X_train_pca, X_test_pca]))
     X_train_tsne = X_tsne[:len(X_train_pca)]
     X_test_tsne = X_tsne[len(X_train_pca):]
@@ -537,7 +490,6 @@ def create_visualizations(X_train, y_train, kmeans, X_test, y_test, movement_nam
     plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(viz_dir, 'tsne_movements.png'), dpi=300)
-    plt.close()
     
     plt.figure(figsize=(12, 10))
     cluster_palette = sns.color_palette("bright", kmeans.n_clusters)
@@ -550,7 +502,6 @@ def create_visualizations(X_train, y_train, kmeans, X_test, y_test, movement_nam
     plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(viz_dir, 'tsne_kmeans_clusters.png'), dpi=300)
-    plt.close()
     
     best_model_name = max(results, key=lambda k: results[k]['accuracy'] if k != 'kmeans' else 0)
     best_model_preds = results[best_model_name]['predictions']
@@ -563,8 +514,8 @@ def create_visualizations(X_train, y_train, kmeans, X_test, y_test, movement_nam
     plt.ylabel('True')
     plt.tight_layout()
     plt.savefig(os.path.join(viz_dir, f'confusion_matrix_{best_model_name}.png'), dpi=300)
-    plt.close()
     
+    # Display feature importances for tree-based models
     for model_name in ['random_forest', 'gradient_boosting']:
         if model_name in models:
             model = models[model_name]['model']
@@ -572,18 +523,30 @@ def create_visualizations(X_train, y_train, kmeans, X_test, y_test, movement_nam
             if hasattr(model, 'feature_importances_'):
                 feature_importances = model.feature_importances_
                 
-                n_to_show = min(20, len(feature_importances))
-                top_indices = np.argsort(feature_importances)[-n_to_show:]
-                plt.figure(figsize=(12, 8))
-                plt.barh(range(len(top_indices)), feature_importances[top_indices], align='center')
-                plt.yticks(range(len(top_indices)), 
-                          [feature_names[i] if i < len(feature_names) else f'Feature {i}' for i in top_indices])
-                plt.xlabel('Feature Importance')
-                plt.title(f'Top {n_to_show} Most Important Features ({model_name.replace("_", " ").title()})')
-                plt.tight_layout()
-                plt.savefig(os.path.join(viz_dir, f'feature_importance_{model_name}.png'), dpi=300)
-                plt.close()
+                # If we used feature selection, we might not have direct correspondence with original features
+                if pca_obj is not None:
+                    plt.figure(figsize=(12, 8))
+                    n_components = len(feature_importances)
+                    plt.barh(range(n_components), feature_importances, align='center')
+                    plt.yticks(range(n_components), [f'Component {i+1}' for i in range(n_components)])
+                    plt.xlabel('Feature Importance')
+                    plt.title(f'Component Importance ({model_name.replace("_", " ").title()})')
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(viz_dir, f'feature_importance_{model_name}.png'), dpi=300)
+                else:
+                    # Show top 20 features or all if less than 20
+                    n_to_show = min(20, len(feature_importances))
+                    top_indices = np.argsort(feature_importances)[-n_to_show:]
+                    plt.figure(figsize=(12, 8))
+                    plt.barh(range(len(top_indices)), feature_importances[top_indices], align='center')
+                    plt.yticks(range(len(top_indices)), 
+                              [feature_names[i] if i < len(feature_names) else f'Feature {i}' for i in top_indices])
+                    plt.xlabel('Feature Importance')
+                    plt.title(f'Top {n_to_show} Most Important Features ({model_name.replace("_", " ").title()})')
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(viz_dir, f'feature_importance_{model_name}.png'), dpi=300)
     
+    # Model accuracy comparison
     accuracies = {name: result['accuracy'] for name, result in results.items()}
     plt.figure(figsize=(12, 6))
     bars = plt.bar(range(len(accuracies)), list(accuracies.values()), tick_label=list(accuracies.keys()))
@@ -592,6 +555,7 @@ def create_visualizations(X_train, y_train, kmeans, X_test, y_test, movement_nam
     plt.ylabel('Accuracy')
     plt.xticks(rotation=45)
     
+    # Add numeric labels above bars
     for bar in bars:
         height = bar.get_height()
         plt.text(bar.get_x() + bar.get_width()/2., height + 0.01,
@@ -599,8 +563,8 @@ def create_visualizations(X_train, y_train, kmeans, X_test, y_test, movement_nam
     
     plt.tight_layout()
     plt.savefig(os.path.join(viz_dir, 'model_accuracy_comparison.png'), dpi=300)
-    plt.close()
     
+    # Per-class performance for the best model
     best_report = results[best_model_name]['report']
     class_metrics = {label: metrics['f1-score'] for label, metrics in best_report.items() 
                     if label not in ['accuracy', 'macro avg', 'weighted avg']}
@@ -613,6 +577,7 @@ def create_visualizations(X_train, y_train, kmeans, X_test, y_test, movement_nam
     plt.ylabel('F1-Score')
     plt.xticks(movement_indices, movement_names, rotation=45)
     
+    # Add numeric labels above bars
     for bar in bars:
         height = bar.get_height()
         plt.text(bar.get_x() + bar.get_width()/2., height + 0.01,
@@ -620,7 +585,6 @@ def create_visualizations(X_train, y_train, kmeans, X_test, y_test, movement_nam
     
     plt.tight_layout()
     plt.savefig(os.path.join(viz_dir, 'per_class_performance.png'), dpi=300)
-    plt.close()
 
 def save_results(models, kmeans, results, output_dir, scaler, feature_selector, feature_names, movement_names):
     """
@@ -642,25 +606,30 @@ def save_results(models, kmeans, results, output_dir, scaler, feature_selector, 
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     
+    # Save feature names and movement names
     np.save(os.path.join(output_dir, 'feature_names.npy'), feature_names)
     np.save(os.path.join(output_dir, 'movement_names.npy'), movement_names)
     
+    # Save scaler and feature selector (if used)
     joblib.dump(scaler, os.path.join(models_dir, 'scaler.joblib'))
     if feature_selector is not None:
         joblib.dump(feature_selector, os.path.join(models_dir, 'feature_selector.joblib'))
     
+    # Save each model
     for name, model_dict in models.items():
         model = model_dict['model']
         joblib.dump(model, os.path.join(models_dir, f'{name}_model.joblib'))
     
+    # Save KMeans model and cluster mappings
     joblib.dump(kmeans, os.path.join(models_dir, 'kmeans_model.joblib'))
     cluster_mapping = results['kmeans']['cluster_mapping']
     np.save(os.path.join(models_dir, 'cluster_mapping.npy'), cluster_mapping)
     
+    # Save results summary as a text file
     with open(os.path.join(output_dir, 'results_summary.txt'), 'w') as f:
         f.write("=== Model Accuracy Results ===\n")
-        for name, result in results.items():
-            f.write(f"{name}: {result['accuracy']:.4f}\n")
+        for name, accuracy in results.items():
+            f.write(f"{name}: {accuracy['accuracy']:.4f}\n")
         f.write(f"\nBest model: {max(results, key=lambda x: results[x]['accuracy'] if x != 'kmeans' else 0)}\n")
         f.write(f"Timestamp: {timestamp}\n")
         f.write(f"Feature count: {len(feature_names)}\n")
@@ -672,17 +641,18 @@ def main():
     
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # Load and preprocess data
     X, y, feature_names, movement_names, df = load_and_preprocess_data(args.data, args.random_state)
     
+    # Create data splits
     X_train, X_val, X_test, y_train, y_val, y_test = create_data_splits(
         X, y, args.test_size, args.val_size, args.random_state
     )
     
+    # Scale features
     X_train_scaled, X_val_scaled, X_test_scaled, scaler = scale_features(X_train, X_val, X_test)
     
-    if args.use_smote:
-        X_train_scaled, y_train = apply_smote(X_train_scaled, y_train, args.random_state)
-    
+    # Apply feature selection
     X_train_reduced, X_val_reduced, X_test_reduced, feature_selector = apply_feature_selection(
         X_train_scaled, X_val_scaled, X_test_scaled, y_train,
         method=args.feature_selection,
@@ -691,31 +661,34 @@ def main():
         random_state=args.random_state
     )
     
+    # Train supervised models
     models = train_supervised_models(
         X_train_reduced, y_train, X_val_reduced, y_val,
         random_state=args.random_state,
-        cross_fold=args.cross_fold,
-        use_ensemble=args.use_ensemble,
-        use_stacking=False
+        use_ensemble=args.use_ensemble
     )
     
+    # Perform unsupervised clustering
     kmeans = perform_unsupervised_clustering(
         X_train_reduced, y_train, X_val_reduced, y_val,
         n_clusters=args.k_clusters,
         random_state=args.random_state
     )
     
+    # Evaluate models on test set
     results = evaluate_models_on_test_set(
         models, kmeans, X_train_reduced, y_train, X_test_reduced, y_test, movement_names
     )
     
+    # Create visualizations if requested
     if args.visualize:
         create_visualizations(
             X_train_reduced, y_train, kmeans, X_test_reduced, y_test, movement_names,
             results, args.output_dir, args.random_state, models, feature_names,
-            feature_selector=feature_selector
+            pca_obj=feature_selector if args.feature_selection == 'pca' else None
         )
     
+    # Save results and models
     save_results(
         models, kmeans, results, args.output_dir, scaler, feature_selector,
         feature_names, movement_names
