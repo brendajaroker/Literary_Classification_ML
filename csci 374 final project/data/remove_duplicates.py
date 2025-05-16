@@ -1,7 +1,7 @@
 import pandas as pd
 
 # Define the filename
-filename = "edited_metadata.csv"  # Replace with your actual CSV file name
+filename = "data.csv"  # Replace with your actual CSV file name
 
 # Load the CSV
 try:

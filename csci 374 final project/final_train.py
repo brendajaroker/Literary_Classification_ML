@@ -21,7 +21,6 @@ import warnings
 import joblib
 from datetime import datetime
 
-# Suppress warnings
 warnings.filterwarnings('ignore')
 
 def parse_arguments():
@@ -39,7 +38,7 @@ def parse_arguments():
                         help='Random seed for reproducibility')
     parser.add_argument('--pca_components', type=int, default=30,
                         help='Number of PCA components to use')
-    parser.add_argument('--k_clusters', type=int, default=5,
+    parser.add_argument('--k_clusters', type=int, default=7, #manually set to 7
                         help='Number of clusters for K-Means')
     parser.add_argument('--visualize', action='store_true',
                         help='Generate visualization plots')
@@ -52,14 +51,7 @@ def parse_arguments():
 
 def load_and_preprocess_data(data_path, random_state):
     """
-    Load and preprocess the feature data.
-    
-    Args:
-        data_path: Path to the CSV file containing features
-        random_state: Random seed for reproducibility
-        
-    Returns:
-        Preprocessed data as pandas DataFrames
+    Load and preprocess the feature data into a pandas df.
     """
     print("Loading data from:", data_path)
     df = pd.read_csv(data_path)
@@ -113,16 +105,6 @@ def create_interaction_terms(X, top_n=10):
 def create_data_splits(X, y, test_size, val_size, random_state):
     """
     Create train/validation/test splits.
-    
-    Args:
-        X: Features
-        y: Target
-        test_size: Proportion of data for testing
-        val_size: Proportion of training data to use for validation
-        random_state: Random seed
-    
-    Returns:
-        Data splits as numpy arrays
     """
     X_trainval, X_test, y_trainval, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
@@ -141,14 +123,7 @@ def create_data_splits(X, y, test_size, val_size, random_state):
 
 def scale_features(X_train, X_val, X_test, model_name='default'):
     """
-    Scale features using StandardScaler or RobustScaler based on model.
-    
-    Args:
-        X_train, X_val, X_test: Data splits
-        model_name: Name of the model to determine scaler
-    
-    Returns:
-        Scaled and clipped data
+    Scale/clip features using StandardScaler or RobustScaler based on model.
     """
     if model_name == 'knn':
         scaler = RobustScaler()
@@ -236,9 +211,6 @@ def apply_pca_for_knn(X_train, X_val, X_test, n_components, random_state):
         X_train, X_val, X_test: Data splits
         n_components: Number of PCA components
         random_state: Random seed
-    
-    Returns:
-        PCA-transformed data
     """
     pca = PCA(n_components=n_components, random_state=random_state)
     X_train_pca = pca.fit_transform(X_train)
@@ -252,15 +224,7 @@ def apply_pca_for_knn(X_train, X_val, X_test, n_components, random_state):
 
 def train_supervised_models(X_train, y_train, X_val, y_val, random_state):
     """
-    Train supervised models with GridSearchCV.
-    
-    Args:
-        X_train, y_train: Training data
-        X_val, y_val: Validation data
-        random_state: Random seed
-    
-    Returns:
-        Dictionary of trained models
+    Train supervised models with GridSearchCV. 
     """
     models = {}
     
@@ -281,9 +245,9 @@ def train_supervised_models(X_train, y_train, X_val, y_val, random_state):
         'logistic': {
             'model': LogisticRegression(max_iter=10000, random_state=random_state),
             'params': {
-                'C': [0.05, 0.1, 0.3],
-                'solver': ['liblinear', 'saga'],
-                'class_weight': ['balanced']
+                'C': [0.05, 0.1, 0.3], # Regularization strength, not infinity
+                'solver': ['liblinear', 'saga'], # saga is faster for large datasets
+                'class_weight': ['balanced'] # 'balanced' means to use the class distribution in the training data
             }
         },
         'random_forest': {
@@ -299,26 +263,26 @@ def train_supervised_models(X_train, y_train, X_val, y_val, random_state):
         'knn': {
             'model': KNeighborsClassifier(),
             'params': {
-                'n_neighbors': [3, 5, 7, 9],
+                'n_neighbors': [3, 5, 7, 9], # Odd numbers to avoid ties
                 'weights': ['distance', class_weighted_distance(X_train, y_train)],
-                'metric': ['cosine', 'manhattan']
+                'metric': ['cosine', 'manhattan'] # Cosine and Manhattan distances are more robust to high-dimensional data 
             }
         },
         'gradient_boosting': {
             'model': GradientBoostingClassifier(random_state=random_state),
             'params': {
-                'n_estimators': [50, 100],
-                'max_depth': [2, 3],
-                'learning_rate': [0.01, 0.03],
-                'subsample': [0.7, 0.8]
+                'n_estimators': [50, 100], # Number of boosting stages
+                'max_depth': [2, 3],   # Shallow trees to avoid overfitting
+                'learning_rate': [0.01, 0.03], 
+                'subsample': [0.7, 0.8] # Fraction of samples to use for fitting the trees
             }
         },
         'svm': {
             'model': SVC(random_state=random_state, probability=True),
             'params': {
-                'C': [0.1, 0.3, 0.5],
-                'kernel': ['rbf'],
-                'gamma': ['scale', 0.005],
+                'C': [0.1, 0.3, 0.5], # Regularization parameter
+                'kernel': ['rbf'], # Radial basis function kernel, default
+                'gamma': ['scale', 0.005], #gamma='scale' is default in SVC, but 0.005 in case it is better
                 'class_weight': ['balanced']
             }
         }
@@ -532,7 +496,7 @@ def create_visualizations(X_train, y_train, kmeans, X_test, y_test, movement_nam
     plt.tight_layout()
     plt.savefig(os.path.join(viz_dir, f'confusion_matrix_{best_model_name}.png'), dpi=300)
     
-    for model_name in ['random_forest', 'gradient_boosting']:
+    for model_name in ['random_forest', 'gradient_boosting', 'svm']:
         if model_name in models:
             model = models[model_name]['model']
             
@@ -598,17 +562,7 @@ def create_visualizations(X_train, y_train, kmeans, X_test, y_test, movement_nam
 
 def save_results(models, kmeans, results, output_dir, scaler, feature_selector, feature_names, movement_names):
     """
-    Save trained models and results.
-    
-    Args:
-        models: Dictionary of supervised models
-        kmeans: KMeans clustering model
-        results: Dictionary of test results
-        output_dir: Directory to save results
-        scaler: Feature scaler
-        feature_selector: Feature selection object
-        feature_names: Names of features
-        movement_names: Names of literary movements
+    Save the results, models, and visualizations. 
     """
     os.makedirs(output_dir, exist_ok=True)
     models_dir = os.path.join(output_dir, 'models')
@@ -642,9 +596,105 @@ def save_results(models, kmeans, results, output_dir, scaler, feature_selector, 
         f.write(f"Timestamp: {timestamp}\n")
         f.write(f"Feature count: {len(feature_names)}\n")
         f.write(f"Literary movements: {', '.join(movement_names)}\n")
+def visualize_kmeans_with_pca(X, kmeans, y, movement_names, output_dir=None, random_state=42):
+    """
+    Visualize K-means clustering results with PCA for dimensionality reduction, combining clusters (by color) and true classes (by marker shape) in one plot.
+    
+    Args:
+        X: Feature matrix
+        kmeans: Trained KMeans model
+        y: True labels
+        movement_names: Names of the movement classes
+        output_dir: Directory to save the visualization (optional)
+        random_state: Random seed for reproducibility
+    """
+    # Apply PCA to reduce to 2 dimensions for visualization
+    pca = PCA(n_components=2, random_state=random_state)
+    X_pca = pca.fit_transform(X)
+    
+    # Get cluster assignments
+    cluster_labels = kmeans.predict(X)
+    
+    # Create a figure with a white background and border
+    fig, ax = plt.subplots(figsize=(12, 10))
+    fig.patch.set_facecolor('white')
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_color('black')
+        spine.set_linewidth(1)
+    
+    # Choose distinct color palettes
+    cluster_palette = sns.color_palette("tab10", kmeans.n_clusters)
+    
+    # Define markers for literary movements
+    markers = {
+        'Gothicism': 'o',        # circle
+        'Modernism': '^',        # triangle up
+        'Naturalism': 's',       # square
+        'Realism': 'D',          # diamond
+        'Renaissance': 'v',      # triangle down
+        'Romanticism': 'p',      # pentagon
+        'Transcendentalism': '*' # star
+    }
+    
+    # Plot each point colored by cluster and shaped by movement
+    for i in range(kmeans.n_clusters):
+        for j, movement in enumerate(movement_names):
+            # Find points that belong to both this cluster and this movement
+            mask = (cluster_labels == i) & (y == j)
+            if np.any(mask):
+                ax.scatter(
+                    X_pca[mask, 0], X_pca[mask, 1],
+                    s=80, 
+                    color=cluster_palette[i],
+                    marker=markers[movement],
+                    alpha=0.7,
+                    label=f'{movement} (Cluster {i})' if j == 0 else None  # Only add to legend once per cluster
+                )
+    
+    # Create custom legend elements
+    from matplotlib.lines import Line2D
+    
+    # First legend for clusters
+    cluster_legend_elements = [
+        Line2D([0], [0], marker='o', color='w', markerfacecolor=cluster_palette[i], 
+               markersize=10, label=f'Cluster {i}')
+        for i in range(kmeans.n_clusters)
+    ]
+    
+    # Second legend for movements
+    movement_legend_elements = [
+        Line2D([0], [0], marker=markers[movement], color='black', 
+               markersize=10, label=movement)
+        for movement in movement_names
+    ]
+    
+    # Add legends
+    cluster_legend = ax.legend(handles=cluster_legend_elements, loc='upper left', 
+                              title="Clusters", bbox_to_anchor=(0.01, 0.99))
+    ax.add_artist(cluster_legend)
+    
+    ax.legend(handles=movement_legend_elements, loc='lower left', 
+             title="Literary Movements", bbox_to_anchor=(0.01, 0.01))
+    
+    # Set labels and title
+    ax.set_xlabel(f'PCA Component 1', fontsize=12)
+    ax.set_ylabel(f'PCA Component 2', fontsize=12)
+    ax.set_title('K-Means Clusters Visualized with PCA', fontsize=14)
+    
+    # Add grid
+    ax.grid(True, linestyle='--', alpha=0.7)
+    
+    plt.tight_layout()
+    
+    # Save if output directory is provided
+    if output_dir:
+        viz_dir = os.path.join(output_dir, 'visualizations')
+        os.makedirs(viz_dir, exist_ok=True)
+        plt.savefig(os.path.join(viz_dir, 'kmeans_pca_visualization.png'), dpi=300, bbox_inches='tight')
+    
 
 def main():
-    """Main function to run the script."""
     args = parse_arguments()
     
     os.makedirs(args.output_dir, exist_ok=True)
@@ -687,6 +737,10 @@ def main():
             X_train_reduced, y_train_balanced, kmeans, X_test_reduced, y_test, movement_names,
             results, args.output_dir, args.random_state, models, feature_names,
             pca_obj=feature_selector if args.feature_selection == 'pca' else None
+        )
+        visualize_kmeans_with_pca(
+            X_train_reduced, kmeans, y_train_balanced, movement_names,
+            output_dir=args.output_dir, random_state=args.random_state
         )
     
     save_results(
